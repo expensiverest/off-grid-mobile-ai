@@ -1,166 +1,57 @@
-name: Build and Release iOS
+name: Build iOS IPA (Unsigned)
 
 on:
-  workflow_dispatch:  # Disabled - manual trigger only for now
-
-permissions:
-  contents: write
+  workflow_dispatch:
 
 jobs:
-  release-ios:
+  build:
     runs-on: macos-latest
 
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          ref: main
-          fetch-depth: 0
 
-      - name: Get version from package.json
-        run: |
-          VERSION=$(node -p "require('./package.json').version")
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-
-      - name: Setup Node.js
+      - name: Setup Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Install npm dependencies
+        run: npm install
 
-      - name: Setup Ruby
-        uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.2'
-          bundler-cache: true
-
-      - name: Install CocoaPods
+      - name: Install CocoaPods dependencies
         run: |
-          gem install cocoapods
-          cd ios && pod install
+          cd ios
+          pod install
 
-      - name: Import signing certificate
-        env:
-          IOS_CERTIFICATE_P12: ${{ secrets.IOS_CERTIFICATE_P12 }}
-          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
-          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+      - name: Build unsigned archive
         run: |
-          # Create temporary keychain
-          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          # Find the scheme name automatically
+          SCHEME=$(xcodebuild -list -workspace ios/*.xcworkspace 2>/dev/null | grep -A 20 "Schemes:" | grep -v "Schemes:" | head -1 | tr -d ' ')
+          echo "Using scheme: $SCHEME"
 
-          # Import certificate
-          CERT_PATH=$RUNNER_TEMP/certificate.p12
-          printf '%s' "$IOS_CERTIFICATE_P12" | base64 --decode > "$CERT_PATH"
-          # Convert password from UTF-8 to Latin-1 (£ char is 2 bytes in UTF-8 but security import expects 1 byte)
-          CERT_PASS=$(printf '%s' "$IOS_CERTIFICATE_PASSWORD" | iconv -f UTF-8 -t ISO-8859-1)
-          security import "$CERT_PATH" \
-            -P "$CERT_PASS" \
-            -A \
-            -t cert \
-            -f pkcs12 \
-            -k "$KEYCHAIN_PATH"
-          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security list-keychain -d user -s "$KEYCHAIN_PATH"
-
-      - name: Import provisioning profile
-        env:
-          IOS_PROVISION_PROFILE: ${{ secrets.IOS_PROVISION_PROFILE }}
-        run: |
-          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          PP_PATH=~/Library/MobileDevice/Provisioning\ Profiles/e529cf17-07cc-43e0-94dd-3e2384d002ce.mobileprovision
-          # Write base64 to temp file first to avoid shell interpretation issues
-          printenv IOS_PROVISION_PROFILE > $RUNNER_TEMP/pp_b64.txt
-          base64 --decode -i $RUNNER_TEMP/pp_b64.txt -o "$PP_PATH"
-          # Verify — expected MD5: 445debe413481bd2085dddab92a78c14
-          echo "Decoded profile size: $(wc -c < "$PP_PATH") bytes (expected: 14383)"
-          echo "Decoded profile MD5: $(md5 -q "$PP_PATH")"
-
-      - name: Sync version to Xcode project
-        run: |
-          VERSION_CODE=$(date +%s)
-          sed -i '' "s/MARKETING_VERSION = .*/MARKETING_VERSION = ${{ env.VERSION }};/" \
-            ios/OffgridMobile.xcodeproj/project.pbxproj
-          sed -i '' "s/CURRENT_PROJECT_VERSION = .*/CURRENT_PROJECT_VERSION = $VERSION_CODE;/" \
-            ios/OffgridMobile.xcodeproj/project.pbxproj
-
-      - name: Build archive
-        run: |
-          xcodebuild archive \
-            -workspace ios/OffgridMobile.xcworkspace \
-            -scheme OffgridMobile \
+          xcodebuild \
+            -workspace ios/*.xcworkspace \
+            -scheme "$SCHEME" \
             -configuration Release \
-            -archivePath $RUNNER_TEMP/OffgridMobile.xcarchive \
-            -destination "generic/platform=iOS" \
-            CODE_SIGN_STYLE=Automatic \
-            DEVELOPMENT_TEAM=84V6KCAC49 \
-            -allowProvisioningUpdates
+            -sdk iphoneos \
+            -archivePath "$RUNNER_TEMP/OffGrid.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            archive
 
-      - name: Export IPA
+      - name: Package into IPA
         run: |
-          xcodebuild -exportArchive \
-            -archivePath $RUNNER_TEMP/OffgridMobile.xcarchive \
-            -exportOptionsPlist ios/ExportOptions.plist \
-            -exportPath $RUNNER_TEMP/export
+          APP_PATH=$(find "$RUNNER_TEMP/OffGrid.xcarchive/Products" -name "*.app" | head -1)
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -r "$APP_PATH" "$RUNNER_TEMP/Payload/"
+          cd "$RUNNER_TEMP"
+          zip -r OffGrid-unsigned.ipa Payload/
 
-          # Rename IPA
-          mv $RUNNER_TEMP/export/OffgridMobile.ipa \
-             $RUNNER_TEMP/export/OffgridMobile-v${{ env.VERSION }}.ipa
-
-      - name: Upload IPA to GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release upload v${{ env.VERSION }} \
-            "$RUNNER_TEMP/export/OffgridMobile-v${{ env.VERSION }}.ipa" \
-            --clobber
-
-      - name: Update AltStore source JSON
-        run: |
-          IPA_SIZE=$(stat -f%z "$RUNNER_TEMP/export/OffgridMobile-v${{ env.VERSION }}.ipa")
-          TODAY=$(date +%Y-%m-%d)
-          DOWNLOAD_URL="https://github.com/alichherawalla/off-grid-mobile/releases/download/v${{ env.VERSION }}/OffgridMobile-v${{ env.VERSION }}.ipa"
-
-          # Update altstore-source.json using node for reliable JSON manipulation
-          node -e "
-            const fs = require('fs');
-            const source = JSON.parse(fs.readFileSync('altstore-source.json', 'utf8'));
-            const app = source.apps[0];
-            const newVersion = {
-              version: '${{ env.VERSION }}',
-              date: '${TODAY}',
-              size: ${IPA_SIZE},
-              downloadURL: '${DOWNLOAD_URL}',
-              localizedDescription: 'Update to v${{ env.VERSION }}'
-            };
-            // Replace existing entry for this version or prepend
-            const idx = app.versions.findIndex(v => v.version === '${{ env.VERSION }}');
-            if (idx >= 0) {
-              app.versions[idx] = newVersion;
-            } else {
-              app.versions.unshift(newVersion);
-            }
-            // Keep only the last 10 versions
-            app.versions = app.versions.slice(0, 10);
-            fs.writeFileSync('altstore-source.json', JSON.stringify(source, null, 2) + '\n');
-          "
-
-      - name: Commit updated AltStore source
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add altstore-source.json
-          git diff --staged --quiet && echo "No changes to commit" && exit 0
-          git commit -m "chore: update AltStore source for v${{ env.VERSION }} [skip ci]"
-          git push
-
-      - name: Cleanup keychain
-        if: always()
-        run: |
-          security delete-keychain $RUNNER_TEMP/app-signing.keychain-db 2>/dev/null || true
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OffGrid-iOS-unsigned
+          path: ${{ runner.temp }}/OffGrid-unsigned.ipa
+          retention-days: 7
